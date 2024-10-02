@@ -33,17 +33,21 @@ type attestationStats struct {
 	successful   uint64
 	errors       uint64
 	errorReasons []string
-	mx           sync.Mutex
+	// read only buffer to speed up flushing
+	errorResponsesBuf []string
+	mx                sync.Mutex
 }
 
+// predefined log buffer size. It depends on how many records approx will be
 const logBufferSize = 1024
 
 func newAttestationStats(ticker *slots.SlotTicker) *attestationStats {
 	s := &attestationStats{
-		successful:   0,
-		errors:       0,
-		errorReasons: make([]string, 0, logBufferSize),
-		mx:           sync.Mutex{},
+		successful:        0,
+		errors:            0,
+		errorReasons:      make([]string, 0, logBufferSize),
+		errorResponsesBuf: make([]string, 0, logBufferSize),
+		mx:                sync.Mutex{},
 	}
 
 	go func() {
@@ -70,20 +74,23 @@ func (s *attestationStats) error(err error, msg string) {
 
 func (s *attestationStats) flush() {
 	s.mx.Lock()
-	defer s.mx.Unlock()
 
 	log.WithFields(logrus.Fields{
 		"successful": s.successful,
 		"failed":     s.errors,
 	}).Info("Attestation stats")
+	s.successful = 0
+	s.errors = 0
+	// here we copy errorResponses to read-only buffer and then do unlock.
+	// This prevents locking of SubmitAttestation execution because copy is faster than just print.
+	copy(s.errorResponsesBuf, s.errorReasons)
+	s.errorReasons = s.errorReasons[:0]
+	s.mx.Unlock()
 
-	for _, v := range s.errorReasons {
+	for _, v := range s.errorResponsesBuf {
 		log.Error(v)
 	}
 
-	s.successful = 0
-	s.errors = 0
-	s.errorReasons = s.errorReasons[:0]
 }
 
 // SubmitAttestation completes the validator client's attester responsibility at a given slot.
