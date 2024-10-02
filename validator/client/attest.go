@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pkg/errors"
@@ -28,6 +29,63 @@ import (
 
 var failedAttLocalProtectionErr = "attempted to make slashable attestation, rejected by local slashing protection"
 
+type attestationStats struct {
+	successful   uint64
+	errors       uint64
+	errorReasons []string
+	mx           sync.Mutex
+}
+
+const logBufferSize = 1024
+
+func newAttestationStats(ticker *slots.SlotTicker) *attestationStats {
+	s := &attestationStats{
+		successful:   0,
+		errors:       0,
+		errorReasons: make([]string, 0, logBufferSize),
+		mx:           sync.Mutex{},
+	}
+
+	go func() {
+		for range ticker.C() {
+			s.flush()
+		}
+	}()
+
+	return s
+}
+
+func (s *attestationStats) success() {
+	s.mx.Lock()
+	defer s.mx.Unlock()
+	s.successful += 1
+}
+
+func (s *attestationStats) error(err error, msg string) {
+	s.mx.Lock()
+	defer s.mx.Unlock()
+	s.errors += 1
+	s.errorReasons = append(s.errorReasons, fmt.Sprintf("%s: %s", err.Error(), msg))
+}
+
+func (s *attestationStats) flush() {
+	s.mx.Lock()
+	defer s.mx.Unlock()
+
+	log.WithFields(logrus.Fields{
+		"successful": s.successful,
+		"failed":     s.errors,
+	}).Info("Attestation stats")
+
+	for _, v := range s.errorReasons {
+		log.Error(v)
+	}
+
+	s.successful = 0
+	s.errors = 0
+	s.errorReasons = s.errorReasons[:0]
+}
+
 // SubmitAttestation completes the validator client's attester responsibility at a given slot.
 // It fetches the latest beacon block head along with the latest canonical beacon state
 // information in order to sign the block and include information about the validator's
@@ -41,12 +99,14 @@ func (v *validator) SubmitAttestation(ctx context.Context, slot primitives.Slot,
 
 	var b strings.Builder
 	if err := b.WriteByte(byte(iface.RoleAttester)); err != nil {
+		v.attStats.error(err, "Could not write role byte for lock key")
 		log.WithError(err).Error("Could not write role byte for lock key")
 		tracing.AnnotateError(span, err)
 		return
 	}
 	_, err := b.Write(pubKey[:])
 	if err != nil {
+		v.attStats.error(err, "Could not write pubkey bytes for lock key")
 		log.WithError(err).Error("Could not write pubkey bytes for lock key")
 		tracing.AnnotateError(span, err)
 		return
@@ -59,6 +119,7 @@ func (v *validator) SubmitAttestation(ctx context.Context, slot primitives.Slot,
 	log := log.WithField("pubkey", fmt.Sprintf("%#x", bytesutil.Trunc(pubKey[:]))).WithField("slot", slot)
 	duty, err := v.duty(pubKey)
 	if err != nil {
+		v.attStats.error(err, "Could not fetch validator assignment")
 		log.WithError(err).Error("Could not fetch validator assignment")
 		if v.emitAccountMetrics {
 			ValidatorAttestFailVec.WithLabelValues(fmtKey).Inc()
@@ -77,6 +138,7 @@ func (v *validator) SubmitAttestation(ctx context.Context, slot primitives.Slot,
 	}
 	data, err := v.validatorClient.AttestationData(ctx, req)
 	if err != nil {
+		v.attStats.error(err, "Could not request attestation to sign at slot")
 		log.WithError(err).Error("Could not request attestation to sign at slot")
 		if v.emitAccountMetrics {
 			ValidatorAttestFailVec.WithLabelValues(fmtKey).Inc()
@@ -87,6 +149,7 @@ func (v *validator) SubmitAttestation(ctx context.Context, slot primitives.Slot,
 
 	sig, _, err := v.signAtt(ctx, pubKey, data, slot)
 	if err != nil {
+		v.attStats.error(err, "Could not sign attestation")
 		log.WithError(err).Error("Could not sign attestation")
 		if v.emitAccountMetrics {
 			ValidatorAttestFailVec.WithLabelValues(fmtKey).Inc()
@@ -114,6 +177,7 @@ func (v *validator) SubmitAttestation(ctx context.Context, slot primitives.Slot,
 
 	_, signingRoot, err := v.domainAndSigningRoot(ctx, indexedAtt.GetData())
 	if err != nil {
+		v.attStats.error(err, "Could not get domain and signing root from attestation")
 		log.WithError(err).Error("Could not get domain and signing root from attestation")
 		if v.emitAccountMetrics {
 			ValidatorAttestFailVec.WithLabelValues(fmtKey).Inc()
@@ -144,6 +208,7 @@ func (v *validator) SubmitAttestation(ctx context.Context, slot primitives.Slot,
 	if ok {
 		// Send the attestation to the beacon node.
 		if err := v.db.SlashableAttestationCheck(ctx, phase0Att, pubKey, signingRoot, v.emitAccountMetrics, ValidatorAttestFailVec); err != nil {
+			v.attStats.error(err, "Failed attestation slashing protection check")
 			log.WithError(err).Error("Failed attestation slashing protection check")
 			log.WithFields(
 				attestationLogFields(pubKey, indexedAtt),
@@ -176,6 +241,7 @@ func (v *validator) SubmitAttestation(ctx context.Context, slot primitives.Slot,
 		attResp, err = v.validatorClient.ProposeAttestation(ctx, attestation)
 	}
 	if err != nil {
+		v.attStats.error(err, "Could not submit attestation to beacon node")
 		log.WithError(err).Error("Could not submit attestation to beacon node")
 		if v.emitAccountMetrics {
 			ValidatorAttestFailVec.WithLabelValues(fmtKey).Inc()
@@ -185,6 +251,7 @@ func (v *validator) SubmitAttestation(ctx context.Context, slot primitives.Slot,
 	}
 
 	if err := v.saveSubmittedAtt(data, pubKey[:], false); err != nil {
+		v.attStats.error(err, "Could not save validator index for logging")
 		log.WithError(err).Error("Could not save validator index for logging")
 		if v.emitAccountMetrics {
 			ValidatorAttestFailVec.WithLabelValues(fmtKey).Inc()
@@ -211,6 +278,8 @@ func (v *validator) SubmitAttestation(ctx context.Context, slot primitives.Slot,
 		ValidatorAttestSuccessVec.WithLabelValues(fmtKey).Inc()
 		ValidatorAttestedSlotsGaugeVec.WithLabelValues(fmtKey).Set(float64(slot))
 	}
+
+	v.attStats.success()
 }
 
 // Given the validator public key, this gets the validator assignment.
