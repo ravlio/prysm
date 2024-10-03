@@ -95,6 +95,7 @@ type validator struct {
 	validatorsRegBatchSize             int
 	interopKeysConfig                  *local.InteropKeymanagerConfig
 	attSelections                      map[attSelectionKey]iface.BeaconCommitteeSelection
+	attStats                           *attestationStats
 	aggregatedSlotCommitteeIDCache     *lru.Cache
 	domainDataCache                    *ristretto.Cache
 	voteStats                          voteStats
@@ -278,7 +279,6 @@ func (v *validator) WaitForChainStart(ctx context.Context) error {
 	}
 
 	v.genesisTime = chainStartRes.GenesisTime
-
 	curGenValRoot, err := v.db.GenesisValidatorsRoot(ctx)
 	if err != nil {
 		return errors.Wrap(err, "could not get current genesis validators root")
@@ -292,7 +292,6 @@ func (v *validator) WaitForChainStart(ctx context.Context) error {
 		v.setTicker()
 		return nil
 	}
-
 	if !bytes.Equal(curGenValRoot, chainStartRes.GenesisValidatorsRoot) {
 		log.Errorf(`The genesis validators root received from the beacon node does not match what is in
 			your validator database. This could indicate that this is a database meant for another network. If
@@ -307,6 +306,7 @@ func (v *validator) WaitForChainStart(ctx context.Context) error {
 		)
 	}
 
+	v.attStats = newAttestationStats(slots.NewSlotTicker(time.Unix(int64(v.genesisTime), 0), params.BeaconConfig().SecondsPerSlot))
 	v.setTicker()
 	return nil
 }
