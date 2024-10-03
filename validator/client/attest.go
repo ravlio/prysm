@@ -83,7 +83,7 @@ func (s *attestationStats) flush() {
 	s.errors = 0
 	// here we copy errorResponses to read-only buffer and then do unlock.
 	// This prevents locking of SubmitAttestation execution because copy is faster than just print.
-	copy(s.errorResponsesBuf, s.errorReasons)
+	s.errorResponsesBuf = s.errorReasons[:]
 	s.errorReasons = s.errorReasons[:0]
 	s.mx.Unlock()
 
